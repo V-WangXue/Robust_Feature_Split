@@ -1,5 +1,6 @@
 from core.train_separator import train_feature_separator
 from core.train_robust import train_robust_classifier
+from core.train_base import train_base_classifier
 from config import Config
 from utils import create_dirs, get_logger
 
@@ -23,17 +24,22 @@ def main():
     
     # 执行训练流程
     try:
-        # 第一步：训练特征分离器（自编码器）
+        # 第一步：训练用于鲁棒性对比的标准分类器
+        logger.info("\n===== 开始训练基础分类器 =====")
+        train_base_classifier()
+
+        # 第二步：训练特征分离器（自编码器）
         logger.info("\n===== 开始训练特征分离器 =====")
         train_feature_separator()
         
-        # 第二步：训练鲁棒分类器并评估
+        # 第三步：训练鲁棒分类器并评估
         logger.info("\n===== 开始训练鲁棒分类器 =====")
         train_robust_classifier()
         
         logger.info("\n===== 项目运行完成 =====")
     except Exception as e:
         logger.error(f"项目运行出错: {str(e)}", exc_info=True)
+        raise
 
 if __name__ == "__main__":
     main()

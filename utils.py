@@ -20,6 +20,8 @@ def create_dirs(dirs):
 
 def save_model(model, path):
     """保存模型权重"""
+    parent_dir = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent_dir, exist_ok=True)
     torch.save(model.state_dict(), path)
     get_logger(__name__).info(f"模型已保存至: {path}")
 
@@ -28,7 +30,8 @@ def load_model(model, path):
     try:
         if not os.path.exists(path):
             raise FileNotFoundError(f"模型文件不存在: {path}")
-        model.load_state_dict(torch.load(path, map_location=Config.device))
+        state_dict = torch.load(path, map_location=Config.device, weights_only=True)
+        model.load_state_dict(state_dict)
         get_logger(__name__).info(f"模型已加载: {path}")
         return model
     except Exception as e:

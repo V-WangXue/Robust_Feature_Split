@@ -14,6 +14,25 @@ from utils import save_model, load_model, get_logger, visualize_features
 logger = get_logger(__name__)
 
 
+def _normalized_bounds(x):
+    """返回 ImageNet 标准化空间中的像素上下界和标准差。"""
+    mean = x.new_tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = x.new_tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    return -mean / std, (1 - mean) / std, std
+
+
+def fgsm_attack(model, x, y, eps):
+    """在原始像素尺度上执行 FGSM，并返回标准化后的对抗样本。"""
+    model.eval()
+    lower, upper, std = _normalized_bounds(x)
+    eps_normalized = eps / std
+    x_adv = x.detach().clone().requires_grad_(True)
+    loss = F.cross_entropy(model(x_adv), y)
+    grad = torch.autograd.grad(loss, x_adv)[0]
+    x_adv = x_adv.detach() + eps_normalized * grad.sign()
+    return torch.maximum(torch.minimum(x_adv, upper), lower)
+
+
 def generate_robust_features(autoencoder, dataloader):
     """生成鲁棒特征数据集"""
     device = Config.device
@@ -33,20 +52,24 @@ def generate_robust_features(autoencoder, dataloader):
 
 # ==================== PGD-10 攻击 ====================
 def pgd_attack(model, x, y, eps=8 / 255, alpha=2 / 255, iters=10):
-    """PGD-10 攻击，返回对抗样本"""
+    """在原始像素尺度上执行 PGD，返回标准化后的对抗样本。"""
     model.eval()
-    x_adv = x.clone().detach() + torch.empty_like(x).uniform_(-eps, eps)
-    x_adv = torch.clamp(x_adv, 0, 1).requires_grad_(True)
+    lower, upper, std = _normalized_bounds(x)
+    eps_normalized = eps / std
+    alpha_normalized = alpha / std
+    random_delta = (torch.rand_like(x) * 2 - 1) * eps_normalized
+    x_adv = x.clone().detach() + random_delta
+    x_adv = torch.maximum(torch.minimum(x_adv, upper), lower).requires_grad_(True)
 
     for _ in range(iters):
-        loss = nn.CrossEntropyLoss()(model(x_adv), y)
-        model.zero_grad()
-        loss.backward()
-        grad = x_adv.grad.data
-        x_adv = x_adv.detach() + alpha * grad.sign()
-        x_adv = torch.clamp(x_adv, x - eps, x + eps)  # 投影回 ε 球
-        x_adv = torch.clamp(x_adv, 0, 1).requires_grad_(True)
-    return x_adv
+        loss = F.cross_entropy(model(x_adv), y)
+        grad = torch.autograd.grad(loss, x_adv)[0]
+        x_adv = x_adv.detach() + alpha_normalized * grad.sign()
+        x_adv = torch.maximum(
+            torch.minimum(x_adv, x + eps_normalized), x - eps_normalized
+        )  # 投影回 ε 球
+        x_adv = torch.maximum(torch.minimum(x_adv, upper), lower).requires_grad_(True)
+    return x_adv.detach()
 
 
 def train_robust_classifier():
@@ -98,8 +121,8 @@ def train_robust_classifier():
         robust_classifier.train()
         running_loss = 0.0
 
-        # 学习率衰减（10轮后降为1/10）
-        if epoch == 10:
+        # 在配置的轮次将学习率降为 1/10
+        if epoch == Config.lr_decay_epoch:
             for param_group in optimizer.param_groups:
                 param_group['lr'] = Config.lr_robust / 10
             logger.info(f"学习率调整为: {Config.lr_robust / 10}")
@@ -148,12 +171,19 @@ def evaluate_robustness(robust_classifier, autoencoder, test_loader, classes):
     )
     base_classifier.eval()
     robust_classifier.eval()
+    autoencoder.eval()
 
-    # 定义FGSM对抗攻击
-    def fgsm_attack(image, epsilon, data_grad):
-        sign_data_grad = data_grad.sign()
-        perturbed_image = image + epsilon * sign_data_grad
-        return torch.clamp(perturbed_image, 0, 1)  # 确保像素值在[0,1]范围
+    class RobustPipeline(nn.Module):
+        def __init__(self, separator, classifier):
+            super().__init__()
+            self.separator = separator
+            self.classifier = classifier
+
+        def forward(self, x):
+            robust_feat, _ = self.separator(x)
+            return self.classifier(robust_feat)
+
+    robust_pipeline = RobustPipeline(autoencoder, robust_classifier).to(device).eval()
 
     # 评估指标初始化
     total = 0
@@ -163,8 +193,6 @@ def evaluate_robustness(robust_classifier, autoencoder, test_loader, classes):
     correct_robust_adv = 0  # 鲁棒分类器-对抗样本(FGSM)
     correct_base_pgd = 0  # 基础分类器-PGD-10
     correct_robust_pgd = 0  # 鲁棒分类器-PGD-10
-
-    criterion = nn.CrossEntropyLoss()
 
     # FGSM 参数
     eps_fgsm = Config.epsilon_fgsm
@@ -184,40 +212,33 @@ def evaluate_robustness(robust_classifier, autoencoder, test_loader, classes):
             _, predicted_base = torch.max(outputs_base.data, 1)
             correct_base += (predicted_base == labels).sum().item()
 
-            robust_feat, _ = autoencoder(inputs)
-            outputs_robust = robust_classifier(robust_feat)
+            outputs_robust = robust_pipeline(inputs)
             _, predicted_robust = torch.max(outputs_robust.data, 1)
             correct_robust += (predicted_robust == labels).sum().item()
 
         # 2. FGSM 对抗样本 —— 需要梯度段
-        inputs_adv = inputs.clone().detach().requires_grad_(True)
-        outputs = base_classifier(inputs_adv)
-        loss = criterion(outputs, labels)
-        base_classifier.zero_grad()
-        loss.backward()
-        data_grad = inputs_adv.grad.data
-        perturbed_input = fgsm_attack(inputs_adv, eps_fgsm, data_grad)
+        base_fgsm = fgsm_attack(base_classifier, inputs, labels, eps_fgsm)
+        robust_fgsm = fgsm_attack(robust_pipeline, inputs, labels, eps_fgsm)
 
         with torch.no_grad():
-            outputs_adv = base_classifier(perturbed_input)
+            outputs_adv = base_classifier(base_fgsm)
             _, predicted_adv = torch.max(outputs_adv.data, 1)
             correct_base_adv += (predicted_adv == labels).sum().item()
 
-            robust_feat_adv, _ = autoencoder(perturbed_input)
-            outputs_robust_adv = robust_classifier(robust_feat_adv)
+            outputs_robust_adv = robust_pipeline(robust_fgsm)
             _, predicted_robust_adv = torch.max(outputs_robust_adv.data, 1)
             correct_robust_adv += (predicted_robust_adv == labels).sum().item()
 
         # 3. PGD-10 对抗样本 —— 需要梯度段
-        inputs_pgd = pgd_attack(base_classifier, inputs, labels, pgd_eps, pgd_alpha, pgd_iters)
+        base_pgd = pgd_attack(base_classifier, inputs, labels, pgd_eps, pgd_alpha, pgd_iters)
+        robust_pgd = pgd_attack(robust_pipeline, inputs, labels, pgd_eps, pgd_alpha, pgd_iters)
 
         with torch.no_grad():
-            outputs_base_pgd = base_classifier(inputs_pgd)
+            outputs_base_pgd = base_classifier(base_pgd)
             _, predicted_base_pgd = torch.max(outputs_base_pgd.data, 1)
             correct_base_pgd += (predicted_base_pgd == labels).sum().item()
 
-            robust_feat_pgd, _ = autoencoder(inputs_pgd)
-            outputs_robust_pgd = robust_classifier(robust_feat_pgd)
+            outputs_robust_pgd = robust_pipeline(robust_pgd)
             _, predicted_robust_pgd = torch.max(outputs_robust_pgd.data, 1)
             correct_robust_pgd += (predicted_robust_pgd == labels).sum().item()
 

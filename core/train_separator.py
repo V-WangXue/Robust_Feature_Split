@@ -11,6 +11,16 @@ from utils import save_model, create_dirs, get_logger
 # ① 新增 SSIM
 from pytorch_msssim import ssim
 
+_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+
+
+def _to_image_range(x):
+    """将 ImageNet 标准化张量转换回 SSIM 需要的 [0, 1] 范围。"""
+    mean = _MEAN.to(device=x.device, dtype=x.dtype)
+    std = _STD.to(device=x.device, dtype=x.dtype)
+    return ((x * std) + mean).clamp(0, 1)
+
 logger = get_logger(__name__)
 
 
@@ -59,13 +69,16 @@ def train_feature_separator():
 
             # 前向传播
             robust_feat, non_robust_feat = autoencoder(inputs)  # 分离特征
-            outputs = base_classifier(non_robust_feat)          # 用非鲁棒特征分类
+            outputs = base_classifier(robust_feat)              # 保证鲁棒特征保留类别语义
 
             # 计算各部分损失
             loss1 = criterion_ce(outputs, labels)               # 分类损失
             loss2 = perceptual_loss(inputs, robust_feat)        # 感知一致性损失
             loss3 = criterion_mse(inputs, robust_feat)          # 特征完整性损失
-            loss4 = 1 - ssim(inputs, robust_feat, data_range=1.0)  # ④ SSIM 损失（骨架不能太糊）
+            loss4 = 1 - ssim(
+                _to_image_range(inputs), _to_image_range(robust_feat), data_range=1.0,
+                size_average=True
+            )  # ④ SSIM 损失（骨架不能太糊）
 
             # 总损失（带权重）
             total_loss = (
@@ -113,7 +126,7 @@ def train_feature_separator():
     autoencoder_path = os.path.join(Config.checkpoints_dir, "robust_feature_autoencoder.pth")
     save_model(autoencoder, autoencoder_path)
 
-    classifier_path = os.path.join(Config.checkpoints_dir, "base_classifier.pth")
+    classifier_path = os.path.join(Config.checkpoints_dir, "separator_aux_classifier.pth")
     save_model(base_classifier, classifier_path)
 
     return autoencoder, base_classifier

@@ -18,11 +18,11 @@ def train_base_classifier():
 
     model = BaseClassifier().to(device)
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=Config.lr_base)
 
     logger.info("开始训练标准 Base Classifier...")
     model.train()
-    for epoch in range(15):
+    for epoch in range(Config.base_epochs):
         total_loss = 0.0
         correct = 0
         total = 0
@@ -40,7 +40,10 @@ def train_base_classifier():
             correct += (predicted == y).sum().item()
 
         acc = 100 * correct / total
-        logger.info(f"Base Epoch {epoch+1:2d} | Loss: {total_loss:.4f} | Acc: {acc:.2f}%")
+        logger.info(
+            f"Base Epoch {epoch+1:2d}/{Config.base_epochs} | "
+            f"Loss: {total_loss / len(train_loader):.4f} | Acc: {acc:.2f}%"
+        )
 
     save_path = os.path.join(Config.checkpoints_dir, "base_classifier.pth")
     save_model(model, save_path)

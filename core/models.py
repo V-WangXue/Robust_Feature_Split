@@ -82,7 +82,7 @@ class SimpleUNet(nn.Module):
 class BaseClassifier(nn.Module):
     def __init__(self, num_classes=6):
         super(BaseClassifier, self).__init__()
-        self.resnet = models.resnet18(pretrained=False)
+        self.resnet = models.resnet18(weights=None)
         self.resnet.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.resnet.fc   = nn.Linear(512, num_classes)
 
@@ -93,7 +93,9 @@ class BaseClassifier(nn.Module):
 class PerceptualLoss(nn.Module):
     def __init__(self):
         super(PerceptualLoss, self).__init__()
-        vgg = models.vgg16(pretrained=True)
+        # 使用随机初始化的固定特征提取器，避免首次运行隐式联网下载权重。
+        # 如需 ImageNet 感知特征，可在本地缓存权重后显式替换为 VGG16_Weights.DEFAULT。
+        vgg = models.vgg16(weights=None)
         self.features = nn.Sequential(*list(vgg.features[:23])).eval()
         for param in self.features.parameters():
             param.requires_grad = False
